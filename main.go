@@ -70,24 +70,37 @@ func countFilesDir(dirPath string) int {
 	return count
 }
 
+// Clean and normalize path for consistent pattern matching.
+func normalizePath(path string) string {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	clean = strings.TrimPrefix(clean, "./")
+	return clean
+}
+
 // Check if path matches any custom exclude pattern.
 func matchesCustomExcludes(path string, isDir bool, customExcludes []string) bool {
-	slashPath := filepath.ToSlash(path)
-	baseName := filepath.Base(slashPath)
+	normPath := normalizePath(path)
+	baseName := filepath.Base(normPath)
 
 	for _, pattern := range customExcludes {
-		cleanPattern := filepath.ToSlash(pattern)
+		normPattern := normalizePath(pattern)
+		normPattern = strings.TrimSuffix(normPattern, "/")
 
-		// Check pattern against full path or base name
-		if matched, _ := filepath.Match(cleanPattern, slashPath); matched {
-			return true
-		}
-		if matched, _ := filepath.Match(cleanPattern, baseName); matched {
+		// Exact match or base name match.
+		if normPath == normPattern || baseName == normPattern {
 			return true
 		}
 
-		// Check directory prefix or substring match
-		if strings.HasPrefix(slashPath, strings.TrimSuffix(cleanPattern, "/")) {
+		// Glob match on relative path or base name.
+		if matched, _ := filepath.Match(normPattern, normPath); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(normPattern, baseName); matched {
+			return true
+		}
+
+		// Directory prefix match.
+		if strings.HasPrefix(normPath, normPattern+"/") {
 			return true
 		}
 	}
@@ -186,6 +199,69 @@ func walkDir(root string, gitIgnore *ignore.GitIgnore, showAll bool, customExclu
 	})
 }
 
+// Process a single file or directory path argument.
+func processPath(path string, gitIgnore *ignore.GitIgnore, showAll bool, customExcludes []string, builder *strings.Builder, st *stats, dryRun bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+
+	if matchesCustomExcludes(path, info.IsDir(), customExcludes) {
+		if dryRun {
+			if info.IsDir() {
+				st.ignoredCustom += countFilesDir(path)
+			} else {
+				st.ignoredCustom++
+			}
+		}
+		return
+	}
+
+	if info.IsDir() {
+		walkDir(path, gitIgnore, showAll, customExcludes, builder, st, dryRun)
+	} else {
+		if !showAll && gitIgnore != nil && gitIgnore.MatchesPath(filepath.ToSlash(path)) {
+			if dryRun {
+				st.ignoredGit++
+			}
+			return
+		}
+		appendFileDump(builder, path, st, dryRun)
+	}
+}
+
+// Expand wildcard pattern recursively across directory tree.
+func processGlobPattern(pattern string, gitIgnore *ignore.GitIgnore, showAll bool, customExcludes []string, builder *strings.Builder, st *stats, dryRun bool) {
+	cleanPattern := filepath.ToSlash(pattern)
+	basePattern := filepath.Base(cleanPattern)
+
+	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			if info != nil && info.IsDir() && info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		relPath, err := filepath.Rel(".", path)
+		if err != nil {
+			return nil
+		}
+
+		slashPath := filepath.ToSlash(relPath)
+		baseName := filepath.Base(slashPath)
+
+		matchedPath, _ := filepath.Match(cleanPattern, slashPath)
+		matchedBase, _ := filepath.Match(basePattern, baseName)
+
+		if matchedPath || matchedBase {
+			processPath(relPath, gitIgnore, showAll, customExcludes, builder, st, dryRun)
+		}
+
+		return nil
+	})
+}
+
 func main() {
 	var excludeFlags arrayFlags
 
@@ -227,32 +303,10 @@ func main() {
 	// Target explicit items if arguments are provided.
 	if len(args) > 0 {
 		for _, arg := range args {
-			info, err := os.Stat(arg)
-			if err != nil {
-				continue
-			}
-
-			if matchesCustomExcludes(arg, info.IsDir(), excludeFlags) {
-				if *dryRunFlag {
-					if info.IsDir() {
-						st.ignoredCustom += countFilesDir(arg)
-					} else {
-						st.ignoredCustom++
-					}
-				}
-				continue
-			}
-
-			if info.IsDir() {
-				walkDir(arg, gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
+			if strings.ContainsAny(arg, "*?") {
+				processGlobPattern(arg, gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
 			} else {
-				if !*allFlag && gitIgnore != nil && gitIgnore.MatchesPath(filepath.ToSlash(arg)) {
-					if *dryRunFlag {
-						st.ignoredGit++
-					}
-					continue
-				}
-				appendFileDump(&builder, arg, &st, *dryRunFlag)
+				processPath(arg, gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
 			}
 		}
 	} else {
