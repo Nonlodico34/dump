@@ -136,16 +136,17 @@ func appendFileDump(builder *strings.Builder, relPath string, st *stats, dryRun 
 
 	isText, err := isTextFile(relPath)
 	if err != nil || !isText {
-		if dryRun && st != nil {
+		if st != nil {
 			st.ignoredBinary++
 		}
 		return
 	}
 
+	if st != nil {
+		st.includedFiles = append(st.includedFiles, cleanPath)
+	}
+
 	if dryRun {
-		if st != nil {
-			st.includedFiles = append(st.includedFiles, cleanPath)
-		}
 		return
 	}
 
@@ -179,12 +180,12 @@ func walkDir(root string, gitIgnore *ignore.GitIgnore, showAll bool, customExclu
 		// Apply custom exclude rules first.
 		if matchesCustomExcludes(relPath, info.IsDir(), customExcludes) {
 			if info.IsDir() {
-				if dryRun && st != nil {
+				if st != nil {
 					st.ignoredCustom += countFilesDir(path)
 				}
 				return filepath.SkipDir
 			}
-			if dryRun && st != nil {
+			if st != nil {
 				st.ignoredCustom++
 			}
 			return nil
@@ -199,12 +200,12 @@ func walkDir(root string, gitIgnore *ignore.GitIgnore, showAll bool, customExclu
 
 			if gitIgnore.MatchesPath(matchPath) {
 				if info.IsDir() {
-					if dryRun && st != nil {
+					if st != nil {
 						st.ignoredGit += countFilesDir(path)
 					}
 					return filepath.SkipDir
 				}
-				if dryRun && st != nil {
+				if st != nil {
 					st.ignoredGit++
 				}
 				return nil
@@ -227,7 +228,7 @@ func processPath(path string, gitIgnore *ignore.GitIgnore, showAll bool, customE
 	}
 
 	if matchesCustomExcludes(path, info.IsDir(), customExcludes) {
-		if dryRun {
+		if st != nil {
 			if info.IsDir() {
 				st.ignoredCustom += countFilesDir(path)
 			} else {
@@ -241,7 +242,7 @@ func processPath(path string, gitIgnore *ignore.GitIgnore, showAll bool, customE
 		walkDir(path, gitIgnore, showAll, customExcludes, builder, st, dryRun)
 	} else {
 		if !showAll && gitIgnore != nil && gitIgnore.MatchesPath(filepath.ToSlash(path)) {
-			if dryRun {
+			if st != nil {
 				st.ignoredGit++
 			}
 			return
@@ -281,8 +282,6 @@ func processGlobPattern(pattern string, gitIgnore *ignore.GitIgnore, showAll boo
 		return nil
 	})
 }
-
-// --- Git changed-files helpers ---
 
 // isGitRepo reports whether the current directory is inside a git work tree.
 func isGitRepo() bool {
@@ -387,7 +386,7 @@ func listGitChanged(cached bool, paths []string) ([]string, error) {
 		files = append(files, line)
 	}
 
-	// Also include untracked files when looking at working tree.
+	// Include untracked files when scanning the working tree.
 	if !cached {
 		untrackedArgs := []string{"ls-files", "--others", "--exclude-standard"}
 		if len(paths) > 0 {
@@ -419,10 +418,8 @@ func getDiff(path string, cached bool) (string, error) {
 	return runGit(args...)
 }
 
-// collectGitChanged builds the ordered list of gitFile entries for a section.
-// It also updates stats with ignored binary/custom counts.
-// When noDiff is true, diffs are not computed nor attached.
-func collectGitChanged(cached bool, paths []string, customExcludes []string, st *stats, dryRun bool, noDiff bool) ([]gitFile, error) {
+// collectGitChanged builds the ordered list of gitFile entries for a section and updates stats.
+func collectGitChanged(cached bool, paths []string, customExcludes []string, st *stats, noDiff bool) ([]gitFile, error) {
 	files, err := listGitChanged(cached, paths)
 	if err != nil {
 		return nil, err
@@ -437,7 +434,7 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 	for _, f := range files {
 		norm := filepath.ToSlash(f)
 		if matchesCustomExcludes(norm, false, customExcludes) {
-			if dryRun && st != nil {
+			if st != nil {
 				st.ignoredCustom++
 			}
 			continue
@@ -448,8 +445,7 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 
 		switch status {
 		case "A":
-			// New file: dump content (from index if staged, filesystem if working),
-			// no diff needed.
+			// New file: dump content without diff.
 			gf.isNew = true
 			var content string
 			if cached {
@@ -463,19 +459,18 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 				continue
 			}
 			if isBinaryContent([]byte(content)) {
-				if dryRun && st != nil {
+				if st != nil {
 					st.ignoredBinary++
 				}
 				continue
 			}
 			gf.content = content
-			gf.diff = "" // no diff for new files
+			gf.diff = ""
 		case "D":
-			// Deleted file: only diff, no content.
+			// Deleted file: show only diff.
 			gf.deleted = true
 			if noDiff {
-				// Without diff a deleted file has nothing to show → skip entirely.
-				if dryRun && st != nil {
+				if st != nil {
 					st.ignoredBinary++
 				}
 				continue
@@ -489,10 +484,10 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 				continue
 			}
 		default:
-			// Modified / renamed / etc.: content + diff.
+			// Modified / renamed / untracked: content + optional diff.
 			var content string
 			if cached {
-				// Coerenza staged: contenuto dall'index, non dal filesystem.
+				// Read staged content from index instead of working tree.
 				content, err = gitShowFile(norm)
 			} else {
 				var data []byte
@@ -503,7 +498,7 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 				continue
 			}
 			if isBinaryContent([]byte(content)) {
-				if dryRun && st != nil {
+				if st != nil {
 					st.ignoredBinary++
 				}
 				continue
@@ -517,28 +512,23 @@ func collectGitChanged(cached bool, paths []string, customExcludes []string, st 
 			}
 		}
 
+		if st != nil {
+			st.includedFiles = append(st.includedFiles, "./"+gf.path)
+		}
 		result = append(result, gf)
 	}
 	return result, nil
 }
 
-// appendGitSection writes a full section (header + files + diffs) to the builder.
-func appendGitSection(builder *strings.Builder, title string, files []gitFile, st *stats, dryRun bool, noDiff bool) {
+// appendGitSection writes section header, file contents, and optional diffs to the builder.
+func appendGitSection(builder *strings.Builder, title string, files []gitFile, noDiff bool) {
 	if len(files) == 0 {
-		return
-	}
-
-	if dryRun {
-		for _, gf := range files {
-			st.includedFiles = append(st.includedFiles, "./"+gf.path)
-		}
 		return
 	}
 
 	builder.WriteString(fmt.Sprintf("=== %s ===\n\n", title))
 	for _, gf := range files {
 		if gf.deleted {
-			// Only diff for deleted files (and only if diffs are enabled).
 			if !noDiff && gf.diff != "" {
 				builder.WriteString(fmt.Sprintf("./%s (deleted, diff):\n```diff\n%s\n```\n\n", gf.path, gf.diff))
 			}
@@ -552,41 +542,46 @@ func appendGitSection(builder *strings.Builder, title string, files []gitFile, s
 	}
 }
 
-// printSummary prints the header info (working dir, command), the list of included
-// files, and the summary counters. The label ("Files to dump:" vs "Files dumped:")
-// depends on dryRun. It always prints the header, even if there are no files.
-func printSummary(st *stats, stagedCount, workingCount int, dryRun bool, extraCounters func()) {
+// appendSummary writes the working dir, command, included files, and summary counters to the builder.
+func appendSummary(builder *strings.Builder, st *stats, dryRun bool, extraCounters func()) {
 	if cwd, err := os.Getwd(); err == nil {
-		fmt.Printf("Working directory: %s\n", cwd)
+		builder.WriteString(fmt.Sprintf("Working directory: %s\n", cwd))
 	}
-	fmt.Printf("Command:           %s\n\n", strings.Join(os.Args, " "))
+	builder.WriteString(fmt.Sprintf("Command:           %s\n\n", strings.Join(os.Args, " ")))
 
 	label := "Files dumped:"
 	if dryRun {
 		label = "Files to dump:"
 	}
 
+	builder.WriteString(label + "\n")
 	if len(st.includedFiles) > 0 {
-		fmt.Println(label)
 		for _, file := range st.includedFiles {
-			fmt.Printf("  %s\n", file)
+			builder.WriteString(fmt.Sprintf("  %s\n", file))
 		}
-		fmt.Println()
 	} else {
-		fmt.Println(label)
-		fmt.Println("  (none)")
-		fmt.Println()
+		builder.WriteString("  (none)\n")
 	}
+	builder.WriteString("\n")
 
-	fmt.Printf("Summary:\n")
-	fmt.Printf("  Files included:                  %d\n", len(st.includedFiles))
+	builder.WriteString("Summary:\n")
+	builder.WriteString(fmt.Sprintf("  Files included:                  %d\n", len(st.includedFiles)))
 	if extraCounters != nil {
 		extraCounters()
 	} else {
-		fmt.Printf("  Files ignored (.gitignore):      %d\n", st.ignoredGit)
+		builder.WriteString(fmt.Sprintf("  Files ignored (.gitignore):      %d\n", st.ignoredGit))
 	}
-	fmt.Printf("  Files ignored (custom -x):       %d\n", st.ignoredCustom)
-	fmt.Printf("  Files ignored (non-text/binary): %d\n", st.ignoredBinary)
+	builder.WriteString(fmt.Sprintf("  Files ignored (custom -x):       %d\n", st.ignoredCustom))
+	builder.WriteString(fmt.Sprintf("  Files ignored (non-text/binary): %d\n", st.ignoredBinary))
+}
+
+func emitOutput(output string) {
+	fmt.Print(output)
+	if output != "" {
+		if err := clipboard.WriteAll(output); err != nil {
+			fmt.Fprintf(os.Stderr, "Error copying to clipboard: %v\n", err)
+		}
+	}
 }
 
 func main() {
@@ -652,61 +647,59 @@ func main() {
 
 	args := flag.Args()
 
-	// --- Git changed-files mode ---
+	// Git changed-files mode.
 	if *changedFlag {
-		// (d) Fatal error if not inside a git repo.
 		requireGitRepo()
 
 		var st stats
-		var builder strings.Builder
+		var outBuilder strings.Builder
+		var contentBuilder strings.Builder
 
-		staged, err := collectGitChanged(true, args, excludeFlags, &st, *dryRunFlag, *noDiffFlag)
+		staged, err := collectGitChanged(true, args, excludeFlags, &st, *noDiffFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading staged changes: %v\n", err)
 			os.Exit(1)
 		}
-		working, err := collectGitChanged(false, args, excludeFlags, &st, *dryRunFlag, *noDiffFlag)
+		working, err := collectGitChanged(false, args, excludeFlags, &st, *noDiffFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading working tree changes: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Always print the summary header first (in both dry-run and normal mode).
-		printSummary(&st, len(staged), len(working), *dryRunFlag, func() {
-			fmt.Printf("  Files included (staged):         %d\n", len(staged))
-			fmt.Printf("  Files included (working):        %d\n", len(working))
+		appendSummary(&outBuilder, &st, *dryRunFlag, func() {
+			outBuilder.WriteString(fmt.Sprintf("  Files included (staged):         %d\n", len(staged)))
+			outBuilder.WriteString(fmt.Sprintf("  Files included (working):        %d\n", len(working)))
 		})
 		if *noDiffFlag {
-			fmt.Printf("  Diffs:                           disabled (-n)\n")
+			outBuilder.WriteString("  Diffs:                           disabled (-n)\n")
 		}
-		fmt.Println()
+		outBuilder.WriteString("\n")
 
-		if *dryRunFlag {
+		if !*dryRunFlag {
+			appendGitSection(&contentBuilder, "STAGED", staged, *noDiffFlag)
+			appendGitSection(&contentBuilder, "WORKING TREE", working, *noDiffFlag)
+
+			gitContent := contentBuilder.String()
+			outBuilder.WriteString(gitContent)
+			emitOutput(outBuilder.String())
+
+			if gitContent == "" {
+				fmt.Fprintln(os.Stderr, "No git changes to dump.")
+			}
 			return
 		}
 
-		appendGitSection(&builder, "STAGED", staged, &st, *dryRunFlag, *noDiffFlag)
-		appendGitSection(&builder, "WORKING TREE", working, &st, *dryRunFlag, *noDiffFlag)
-
-		output := builder.String()
-		if output == "" {
-			fmt.Fprintln(os.Stderr, "No git changes to dump.")
-			return
-		}
-		fmt.Print(output)
-		if err := clipboard.WriteAll(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error copying to clipboard: %v\n", err)
-		}
+		emitOutput(outBuilder.String())
 		return
 	}
 
-	// `--no-diff` only makes sense with `-c`.
 	if *noDiffFlag {
 		fmt.Fprintln(os.Stderr, "Error: -n/--no-diff can only be used together with -c/--changed.")
 		os.Exit(1)
 	}
 
-	var builder strings.Builder
+	var outBuilder strings.Builder
+	var contentBuilder strings.Builder
 	var st stats
 
 	// Load .gitignore if present and not overridden by -a/--all flag.
@@ -721,32 +714,21 @@ func main() {
 	if len(args) > 0 {
 		for _, arg := range args {
 			if strings.ContainsAny(arg, "*?") {
-				processGlobPattern(arg, gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
+				processGlobPattern(arg, gitIgnore, *allFlag, excludeFlags, &contentBuilder, &st, *dryRunFlag)
 			} else {
-				processPath(arg, gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
+				processPath(arg, gitIgnore, *allFlag, excludeFlags, &contentBuilder, &st, *dryRunFlag)
 			}
 		}
 	} else {
-		walkDir(".", gitIgnore, *allFlag, excludeFlags, &builder, &st, *dryRunFlag)
+		walkDir(".", gitIgnore, *allFlag, excludeFlags, &contentBuilder, &st, *dryRunFlag)
 	}
 
-	// Always print the summary header first (in both dry-run and normal mode).
-	printSummary(&st, 0, 0, *dryRunFlag, nil)
-	fmt.Println()
+	appendSummary(&outBuilder, &st, *dryRunFlag, nil)
+	outBuilder.WriteString("\n")
 
-	if *dryRunFlag {
-		return
+	if !*dryRunFlag {
+		outBuilder.WriteString(contentBuilder.String())
 	}
 
-	output := builder.String()
-
-	// Print output to terminal.
-	fmt.Print(output)
-
-	// Copy output to system clipboard.
-	if output != "" {
-		if err := clipboard.WriteAll(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error copying to clipboard: %v\n", err)
-		}
-	}
+	emitOutput(outBuilder.String())
 }
